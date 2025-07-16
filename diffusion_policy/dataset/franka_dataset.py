@@ -60,6 +60,7 @@ class FrankaDataset(BaseImageDataset):
                     # cache does not exist
                     try:
                         print('Cache does not exist. Creating!')
+                        # For pre-processed zarr files, load and copy to memory
                         replay_buffer = _get_replay_buffer(
                             dataset_path=dataset_path,
                             shape_meta=shape_meta,
@@ -81,10 +82,12 @@ class FrankaDataset(BaseImageDataset):
                             src_store=zip_store, store=zarr.MemoryStore())
                     print('Loaded!')
         else:
+            # Load directly from disk without caching to save memory
+            print(f'Loading dataset directly from disk: {dataset_path}')
             replay_buffer = _get_replay_buffer(
                 dataset_path=dataset_path,
                 shape_meta=shape_meta,
-                store=zarr.MemoryStore()
+                store=None  # Load from disk directly for memory efficiency
             )
         
         # Parse shape meta to identify RGB and lowdim keys
@@ -210,18 +213,24 @@ class FrankaDataset(BaseImageDataset):
 def _get_replay_buffer(dataset_path, shape_meta, store):
     """Load replay buffer from zarr file."""
     
-    if dataset_path.endswith('.zarr.zip'):
-        # Load from zip store
-        with zarr.ZipStore(dataset_path, mode='r') as zip_store:
-            replay_buffer = ReplayBuffer.copy_from_store(
-                src_store=zip_store, store=store)
-    elif dataset_path.endswith('.zarr') or os.path.isdir(dataset_path):
-        # Load from directory store
-        with zarr.DirectoryStore(dataset_path) as dir_store:
-            replay_buffer = ReplayBuffer.copy_from_store(
-                src_store=dir_store, store=store)
+    if store is None:
+        # Load directly from disk to save memory - for large datasets
+        print(f"Loading dataset directly from disk without copying to memory")
+        replay_buffer = ReplayBuffer.create_from_path(dataset_path, mode='r')
     else:
-        raise ValueError(f"Unsupported dataset format: {dataset_path}")
+        # Load and copy to specified store (memory or other)
+        if dataset_path.endswith('.zarr.zip'):
+            # Load from zip store
+            with zarr.ZipStore(dataset_path, mode='r') as zip_store:
+                replay_buffer = ReplayBuffer.copy_from_store(
+                    src_store=zip_store, store=store)
+        elif dataset_path.endswith('.zarr') or os.path.isdir(dataset_path):
+            # Load from directory store
+            with zarr.DirectoryStore(dataset_path) as dir_store:
+                replay_buffer = ReplayBuffer.copy_from_store(
+                    src_store=dir_store, store=store)
+        else:
+            raise ValueError(f"Unsupported dataset format: {dataset_path}")
     
     return replay_buffer
 

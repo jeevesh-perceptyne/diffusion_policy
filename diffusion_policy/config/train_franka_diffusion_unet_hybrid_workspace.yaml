@@ -56,15 +56,15 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   shuffle: False
   pin_memory: True
   persistent_workers: False
@@ -84,7 +84,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 1000
+  num_epochs: 3000
   gradient_accumulate_every: 1
   # EMA
   use_ema: True
@@ -107,15 +107,6 @@ logging:
   tags: ["${name}", "${task_name}", "${exp_name}"]
   id: null
   group: null
-
-checkpoint:
-  topk:
-    monitor_key: train_loss
-    mode: min
-    k: 5
-    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt'
-  save_last_ckpt: True
-  save_last_snapshot: False
 
 multi_run:
   run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}

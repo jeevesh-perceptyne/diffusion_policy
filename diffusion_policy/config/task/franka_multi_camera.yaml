@@ -4,7 +4,7 @@ image_shape: [3, 480, 640]  # C, H, W
 joint_dim: 8  # Adjust based on your robot's DOF
 action_dim: 8  # Adjust based on your action space
 
-dataset_path: /mnt/data/franka_processed.zarr
+dataset_path: /mnt/SharedDrive/franka_diff2d_processed.zarr
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
@@ -37,7 +37,7 @@ dataset:
   pad_after: ${eval:'${n_action_steps}-1'}
   n_obs_steps: ${dataset_obs_steps}
   n_latency_steps: ${n_latency_steps}
-  use_cache: True
+  use_cache: False  # Disabled to avoid memory issues with large datasets
   seed: 42
   val_ratio: 0.1
   max_train_episodes: null

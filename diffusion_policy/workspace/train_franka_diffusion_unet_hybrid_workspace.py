@@ -19,11 +19,14 @@ import wandb
 import tqdm
 import numpy as np
 import shutil
+import psutil
+import gc
+import boto3
+from botocore.exceptions import NoCredentialsError
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
 from diffusion_policy.dataset.franka_dataset import FrankaDataset
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
-from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
@@ -36,6 +39,18 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
+        
+        # S3 configuration
+        self.s3_bucket = 'pr-checkpoints'
+        try:
+            self.s3_client = boto3.client('s3')
+            # Test S3 connection
+            self.s3_client.head_bucket(Bucket=self.s3_bucket)
+            print(f"✓ S3 connection established. Using bucket: {self.s3_bucket}")
+        except Exception as e:
+            print(f"⚠ S3 setup failed: {e}")
+            print("Checkpoints will not be saved to S3")
+            self.s3_client = None
         
         # set seed
         seed = cfg.training.seed
@@ -57,22 +72,137 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
         # configure training state
         self.global_step = 0
         self.epoch = 0
+        self.lr_scheduler = None  # will be set in run()
+
+    def s3_ckpt_path(self, epoch=None, latest=False):
+        """Generate S3 checkpoint path"""
+        if latest:
+            return f"franka_diffusion_outputs/latest/checkpoint.pth"
+        else:
+            return f"franka_diffusion_outputs/epoch_{epoch}/checkpoint.pth"
+
+    def save_checkpoint_s3(self, epoch, latest=False):
+        """Save checkpoint to S3"""
+        if self.s3_client is None:
+            print("⚠ S3 client not available, skipping checkpoint save")
+            return
+            
+        checkpoint = {
+            'epoch': self.epoch,
+            'global_step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+            'config': OmegaConf.to_container(self.cfg, resolve=True),
+        }
+        
+        # Save normalizer state_dict for robust inference
+        if hasattr(self.model, 'normalizer') and self.model.normalizer is not None:
+            checkpoint['normalizer_state_dict'] = self.model.normalizer.state_dict()
+            
+        if self.ema_model is not None:
+            checkpoint['ema_state_dict'] = self.ema_model.state_dict()
+        
+        local_path = f'checkpoint_tmp.pth'
+        torch.save(checkpoint, local_path)
+        
+        if latest:
+            # Save only to latest path when latest=True
+            s3_path = self.s3_ckpt_path(latest=True)
+        else:
+            # Save only to epoch-specific path when latest=False
+            s3_path = self.s3_ckpt_path(epoch=epoch)
+        
+        try:
+            self.s3_client.upload_file(local_path, self.s3_bucket, s3_path)
+            
+            # Also save config as yaml for easy inspection/inference
+            config_yaml_path = 'config_tmp.yaml'
+            with open(config_yaml_path, 'w') as f:
+                OmegaConf.save(self.cfg, f)
+            s3_config_path = s3_path.replace('checkpoint.pth', 'config.yaml')
+            self.s3_client.upload_file(config_yaml_path, self.s3_bucket, s3_config_path)
+            
+            os.remove(local_path)
+            os.remove(config_yaml_path)
+            print(f"✓ Checkpoint and config saved to S3: {s3_path}")
+        except Exception as e:
+            print(f"⚠ Failed to save checkpoint to S3: {e}")
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            if os.path.exists('config_tmp.yaml'):
+                os.remove('config_tmp.yaml')
+
+    def load_latest_checkpoint_s3(self, device):
+        """Load latest checkpoint from S3"""
+        if self.s3_client is None:
+            print("⚠ S3 client not available, skipping checkpoint load")
+            return
+            
+        s3_latest = self.s3_ckpt_path(latest=True)
+        local_path = 'checkpoint_latest_tmp.pth'
+        try:
+            self.s3_client.download_file(self.s3_bucket, s3_latest, local_path)
+            ckpt = torch.load(local_path, map_location=device)
+            
+            self.model.load_state_dict(ckpt['model_state_dict'])
+            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            
+            if self.lr_scheduler and 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict']:
+                self.lr_scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                
+            if self.ema_model and 'ema_state_dict' in ckpt:
+                self.ema_model.load_state_dict(ckpt['ema_state_dict'])
+                
+            # Restore normalizer state_dict if present
+            if hasattr(self.model, 'normalizer') and 'normalizer_state_dict' in ckpt:
+                self.model.normalizer.load_state_dict(ckpt['normalizer_state_dict'])
+                
+            self.epoch = ckpt['epoch']
+            self.global_step = ckpt['global_step']
+            
+            # Optionally restore config
+            if 'config' in ckpt:
+                self.cfg = OmegaConf.create(ckpt['config'])
+                
+            print(f"✓ Resumed from S3 checkpoint at epoch {self.epoch}, step {self.global_step}")
+            os.remove(local_path)
+            
+        except Exception as e:
+            print(f"No S3 checkpoint found or error loading checkpoint: {e}")
 
     def run(self):
+        # print(f"Running workspace {self.__class__.__name__} with config:\n{OmegaConf.to_yaml(self.cfg)}")
         cfg = copy.deepcopy(self.cfg)
 
-        # resume training
-        # if cfg.training.resume:
-        #     lastest_ckpt_path = self.get_checkpoint_path()
-        #     if lastest_ckpt_path.is_file():
-        #         print(f"Resuming from checkpoint {lastest_ckpt_path}")
-        #         self.load_checkpoint(path=lastest_ckpt_path)
+        # Resume from latest S3 checkpoint if requested
+        device = torch.device(cfg.training.device)
+        if cfg.training.resume:
+            self.load_latest_checkpoint_s3(device)
 
         # configure dataset
         dataset: FrankaDataset
+        print(f"Loading dataset from {cfg.task.dataset_path}")
+        
+        # Monitor memory before dataset loading
+        process = psutil.Process(os.getpid())
+        memory_before = process.memory_info().rss / 1024 / 1024
+        print(f"Memory usage before dataset loading: {memory_before:.1f} MB")
+        
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, FrankaDataset)
+        
+        # Monitor memory after dataset loading
+        memory_after = process.memory_info().rss / 1024 / 1024
+        print(f"Memory usage after dataset loading: {memory_after:.1f} MB")
+        print(f"Memory increase: {memory_after - memory_before:.1f} MB")
+        
+        print(f"Dataset {dataset.__class__.__name__} loaded with {len(dataset)} samples")
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        print(f"Training dataloader created with {len(train_dataloader)} batches")
+        
+        # Force garbage collection
+        gc.collect()
         
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
@@ -85,7 +215,7 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
-        lr_scheduler = get_scheduler(
+        self.lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
@@ -96,13 +226,6 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
             # however huggingface diffusers steps it every batch
             last_epoch=self.global_step-1
         )
-
-        # configure ema
-        ema: EMAModel = None
-        if cfg.training.use_ema:
-            ema = hydra.utils.instantiate(
-                cfg.ema,
-                model=self.ema_model)
 
         # configure env
         # Note: For real robot applications, replace this with actual env runner
@@ -124,11 +247,12 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
             }
         )
 
-        # configure checkpoint
-        # topk_manager = TopKCheckpointManager(
-        #     save_dir=os.path.join(self.output_dir, 'checkpoints'),
-        #     **cfg.checkpoint.topk
-        # )
+        # configure ema
+        ema = None
+        if cfg.training.use_ema:
+            ema = hydra.utils.instantiate(
+                cfg.ema,
+                model=self.ema_model)
 
         # device transfer
         device = torch.device(cfg.training.device)
@@ -165,10 +289,10 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
-                            lr_scheduler.step()
+                            self.lr_scheduler.step()
                         
                         # update ema
-                        if cfg.training.use_ema:
+                        if cfg.training.use_ema and ema is not None:
                             ema.step(self.model)
 
                         # logging
@@ -178,7 +302,7 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
                             'train_loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0]
+                            'lr': self.lr_scheduler.get_last_lr()[0]
                         }
 
                         is_last_batch = (batch_idx == (len(train_dataloader) - 1))
@@ -234,26 +358,14 @@ class TrainFrankaDiffusionUnetHybridWorkspace(BaseWorkspace):
                     policy.train()
                     step_log.update(runner_log)
 
-                # checkpoint
-                # if (self.epoch % cfg.training.checkpoint_every) == 0:
-                #     # checkpointing
-                #     if cfg.checkpoint.save_last_ckpt:
-                #         self.save_checkpoint()
-                #     if cfg.checkpoint.save_last_snapshot:
-                #         self.save_snapshot()
-
-                #     # sanitize metric names
-                #     metric_dict = dict()
-                #     for key, value in step_log.items():
-                #         new_key = key.replace('/', '_')
-                #         metric_dict[new_key] = value
-                    
-                    # We can't do top-k selection by validation loss for now
-                    # since we don't have a real environment to get scores from
-                    # save_path = topk_manager.get_ckpt_path(metric_dict)
-
-                    # if save_path is not None:
-                    #     self.save_checkpoint(path=save_path)
+                # S3 Checkpoint saving strategy:
+                # 1. Save latest checkpoint every 100 epochs (overwrites previous latest)  
+                if (self.epoch) % 100 == 0:
+                    self.save_checkpoint_s3(epoch=self.epoch + 1, latest=True)
+                
+                # 2. Save numbered checkpoint every 500 epochs
+                if (self.epoch + 1) % 1 == 0:
+                    self.save_checkpoint_s3(epoch=self.epoch + 1, latest=False)
                 
                 # log of last batch is combined with validation and rollout
                 wandb_run.log(step_log, step=self.global_step)
